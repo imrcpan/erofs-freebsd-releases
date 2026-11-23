@@ -15,10 +15,6 @@ on:
         default: "dev"
         required: true
         type: string
-      skip_world:
-        description: Skip building the world, use the latest prebuilt one
-        type: boolean
-        default: true
       force:
         description: "Rebuild and publish even if this commit was already released"
         type: boolean
@@ -34,7 +30,6 @@ concurrency:
 env:
   SRC_REPO: ${{ github.event.inputs.src_repo }}
   SRC_BRANCH: ${{ github.event.inputs.src_branch }}
-  SKIP_WORLD: ${{ github.event.inputs.skip_world }}
   FORCE: ${{ github.event.inputs.force }}
   BUNDLE: ${{ github.workspace }}/freebsd-built.tar.zst
 
@@ -92,7 +87,8 @@ jobs:
           src-repo: ${{ env.SRC_REPO }}
           src-branch: ${{ steps.resolve.outputs.sha }}
           kernconf: GENERIC
-          skip-world: ${{ env.SKIP_WORLD }}
+          # The world is never shipped, so always build against the prebuilt one.
+          skip-world: true
           export-image: ${{ env.BUNDLE }}
 
       - name: Package the kernel
