@@ -66,6 +66,8 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # No checkout in this job, so tell gh which repository to talk to.
+          GH_REPO: ${{ github.repository }}
           SHORT: ${{ steps.resolve.outputs.short }}
         run: |
           if [ "$FORCE" = "true" ]; then
@@ -174,6 +176,7 @@ jobs:
         if: steps.check.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ steps.resolve.outputs.tag }}
           TITLE: ${{ steps.resolve.outputs.title }}
           ASSET: ${{ steps.resolve.outputs.asset }}
