@@ -57,7 +57,7 @@ jobs:
             echo "sha=$sha"
             echo "short=$short"
             echo "tag=${date}_${short}"
-            echo "asset=erofs_freebsd_kernel_${short}.tar.gz"
+            echo "asset=erofs_freebsd_kernel_amd64_${short}.tar.gz"
             echo "title=EROFS FreeBSD Kernel ${short}"
           } >> "$GITHUB_OUTPUT"
           echo "#### $SRC_REPO ${SRC_BRANCH:-HEAD} -> $sha" >> "$GITHUB_STEP_SUMMARY"
