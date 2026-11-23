@@ -1,0 +1,211 @@
+name: build-kernel-latest
+
+on:
+  # Manual only, from the Actions tab.  A run whose commit was already
+  # released (same short hash in any tag) exits early.
+  workflow_dispatch:
+    inputs:
+      src_repo:
+        description: "Target FreeBSD Repository"
+        default: "https://github.com/imrcpan/erofs-freebsd.git"
+        required: true
+        type: string
+      src_branch:
+        description: "Target FreeBSD Branch"
+        default: "dev"
+        required: true
+        type: string
+      skip_world:
+        description: Skip building the world, use the latest prebuilt one
+        type: boolean
+        default: true
+      force:
+        description: "Rebuild and publish even if this commit was already released"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-kernel-latest
+  cancel-in-progress: false
+
+env:
+  SRC_REPO: ${{ github.event.inputs.src_repo }}
+  SRC_BRANCH: ${{ github.event.inputs.src_branch }}
+  SKIP_WORLD: ${{ github.event.inputs.skip_world }}
+  FORCE: ${{ github.event.inputs.force }}
+  BUNDLE: ${{ github.workspace }}/freebsd-built.tar.zst
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - name: Resolve source commit
+        id: resolve
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote "$SRC_REPO" "${SRC_BRANCH:-HEAD}" | awk 'NR == 1 { print $1 }')"
+          if [ -z "$sha" ]; then
+            echo "::error::cannot resolve ${SRC_BRANCH:-HEAD} in $SRC_REPO"
+            exit 1
+          fi
+          short="${sha:0:12}"
+          date="$(date -u +%y%m%d)"
+          {
+            echo "sha=$sha"
+            echo "short=$short"
+            echo "tag=${date}_${short}"
+            echo "asset=erofs_freebsd_kernel_${short}.tar.gz"
+            echo "title=EROFS FreeBSD Kernel ${short}"
+          } >> "$GITHUB_OUTPUT"
+          echo "#### $SRC_REPO ${SRC_BRANCH:-HEAD} -> $sha" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check for an existing release of this commit
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHORT: ${{ steps.resolve.outputs.short }}
+        run: |
+          if [ "$FORCE" = "true" ]; then
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "#### rebuild forced" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if gh release list --limit 500 --json tagName --jq '.[].tagName' | grep -q "_${SHORT}\$"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "#### ${SHORT} is already released, nothing to do" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build FreeBSD kernel
+        if: steps.check.outputs.exists != 'true'
+        uses: imrcpan/freebsd-kernel-ci-tester@main
+        with:
+          src-repo: ${{ env.SRC_REPO }}
+          src-branch: ${{ steps.resolve.outputs.sha }}
+          kernconf: GENERIC
+          skip-world: ${{ env.SKIP_WORLD }}
+          export-image: ${{ env.BUNDLE }}
+
+      - name: Package the kernel
+        id: package
+        if: steps.check.outputs.exists != 'true'
+        env:
+          SHA: ${{ steps.resolve.outputs.sha }}
+          ASSET: ${{ steps.resolve.outputs.asset }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/kernel"
+          out="$work/out"
+          mkdir -p "$out"
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-utils zstd
+          sudo modprobe ufs || echo "::warning::could not load the ufs module"
+
+          # export-image leaves the powered-off VM behind: a qcow2 disk plus
+          # the ssh key.  Only the disk is needed here.
+          tar --zstd -xf "$BUNDLE" -C "$work" disk.qcow2
+          qemu-img convert -O raw "$work/disk.qcow2" "$work/disk.raw"
+          rm -f "$work/disk.qcow2"
+
+          loop="$(sudo losetup -fP --show "$work/disk.raw")"
+          echo "attached $loop"
+          cleanup() {
+            sudo umount -R /mnt/freebsd 2>/dev/null || true
+            sudo losetup -d "$loop" 2>/dev/null || true
+            rm -f "$work/disk.raw"
+          }
+          trap cleanup EXIT
+
+          # The release images are BASIC-CLOUDINIT-ufs; the ufs root sits in one
+          # of the partitions, so try them until /boot/kernel shows up.
+          sudo mkdir -p /mnt/freebsd
+          root=""
+          for part in "${loop}"p*; do
+            if sudo mount -t ufs -o ro,ufstype=ufs2 "$part" /mnt/freebsd 2>/dev/null; then
+              if [ -d /mnt/freebsd/boot/kernel ]; then
+                root=/mnt/freebsd
+                echo "mounted $part"
+                break
+              fi
+              sudo umount /mnt/freebsd
+            fi
+          done
+          if [ -z "$root" ]; then
+            echo "::error::no UFS root with /boot/kernel in the exported image"
+            lsblk -f
+            exit 1
+          fi
+
+          cat > "$work/build-info.txt" <<EOF
+          source-repo: $SRC_REPO
+          source-branch: $SRC_BRANCH
+          commit: $SHA
+          kernconf: GENERIC
+          built: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+
+          sudo tar -C "$root" -czf "$out/$ASSET" boot/kernel -C "$work" build-info.txt
+          sudo chown "$(id -u):$(id -g)" "$out/$ASSET"
+          (cd "$out" && sha256sum "$ASSET" > "$ASSET.sha256")
+          ls -lh "$out"
+
+          {
+            echo "path=$out/$ASSET"
+            echo "sum=$(cut -d' ' -f1 "$out/$ASSET.sha256")"
+            echo "size=$(stat -c%s "$out/$ASSET")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload the kernel tarball
+        if: steps.check.outputs.exists != 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: erofs-freebsd-kernel-${{ steps.resolve.outputs.short }}
+          path: ${{ steps.package.outputs.path }}
+          retention-days: 1
+          compression-level: 0
+
+      - name: Publish GitHub release
+        if: steps.check.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.resolve.outputs.tag }}
+          TITLE: ${{ steps.resolve.outputs.title }}
+          ASSET: ${{ steps.resolve.outputs.asset }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          SUM: ${{ steps.package.outputs.sum }}
+          SIZE: ${{ steps.package.outputs.size }}
+          PATH_ASSET: ${{ steps.package.outputs.path }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          cat > "$notes" <<EOF
+          FreeBSD kernel built from $SRC_REPO ($SRC_BRANCH).
+
+          * commit: $SHA
+          * kernel config: GENERIC
+          * built: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          * size: $SIZE bytes
+          * sha256: $SUM
+
+          The tarball holds boot/kernel (kernel and modules) plus build-info.txt.
+          Unpack it at the root of a matching FreeBSD system:
+
+              tar -xzf $ASSET -C /
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$PATH_ASSET" --clobber
+          else
+            gh release create "$TAG" "$PATH_ASSET" --title "$TITLE" --notes-file "$notes"
+          fi
+          echo "#### released $TAG" >> "$GITHUB_STEP_SUMMARY"
