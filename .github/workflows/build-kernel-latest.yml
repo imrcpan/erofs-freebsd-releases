@@ -1,8 +1,8 @@
 name: build-kernel-latest
 
 on:
-  # Manual only, from the Actions tab.  A run whose commit was already
-  # released (same short hash in any tag) exits early.
+  # Manual only, from the Actions tab.  The check job below stops a run whose
+  # commit is already released before the expensive build starts.
   workflow_dispatch:
     inputs:
       src_repo:
@@ -16,7 +16,7 @@ on:
         required: true
         type: string
       force:
-        description: "Rebuild and publish even if this commit was already released"
+        description: "Rebuild and replace the assets of an existing release"
         type: boolean
         default: false
 
@@ -38,9 +38,15 @@ defaults:
     shell: bash
 
 jobs:
-  build-kernel:
+  check:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      short: ${{ steps.resolve.outputs.short }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      asset: ${{ steps.resolve.outputs.asset }}
+      title: ${{ steps.resolve.outputs.title }}
     steps:
       - name: Resolve source commit
         id: resolve
@@ -62,8 +68,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "#### $SRC_REPO ${SRC_BRANCH:-HEAD} -> $sha" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Check for an existing release of this commit
-        id: check
+      - name: Fail fast if this commit is already released
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # No checkout in this job, so tell gh which repository to talk to.
@@ -71,23 +76,26 @@ jobs:
           SHORT: ${{ steps.resolve.outputs.short }}
         run: |
           if [ "$FORCE" = "true" ]; then
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "#### rebuild forced" >> "$GITHUB_STEP_SUMMARY"
+            echo "#### force on, ${SHORT} will be rebuilt and its assets replaced" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
-          if gh release list --limit 500 --json tagName --jq '.[].tagName' | grep -q "_${SHORT}\$"; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "#### ${SHORT} is already released, nothing to do" >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+          existing="$(gh release list --limit 500 --json tagName --jq '.[].tagName' | grep "_${SHORT}\$" || true)"
+          if [ -n "$existing" ]; then
+            echo "::error::commit ${SHORT} is already released as ${existing//$'\n'/, }; rerun with force to rebuild"
+            exit 1
           fi
+          echo "#### ${SHORT} is not released yet" >> "$GITHUB_STEP_SUMMARY"
 
+  build-kernel:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
       - name: Build FreeBSD kernel
-        if: steps.check.outputs.exists != 'true'
         uses: imrcpan/freebsd-kernel-ci-tester@main
         with:
           src-repo: ${{ env.SRC_REPO }}
-          src-branch: ${{ steps.resolve.outputs.sha }}
+          src-branch: ${{ needs.check.outputs.sha }}
           kernconf: GENERIC
           # The world is never shipped, so always build against the prebuilt one.
           skip-world: true
@@ -95,10 +103,9 @@ jobs:
 
       - name: Package the kernel
         id: package
-        if: steps.check.outputs.exists != 'true'
         env:
-          SHA: ${{ steps.resolve.outputs.sha }}
-          ASSET: ${{ steps.resolve.outputs.asset }}
+          SHA: ${{ needs.check.outputs.sha }}
+          ASSET: ${{ needs.check.outputs.asset }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/kernel"
@@ -164,23 +171,22 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Upload the kernel tarball
-        if: steps.check.outputs.exists != 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: erofs-freebsd-kernel-${{ steps.resolve.outputs.short }}
+          name: erofs-freebsd-kernel-${{ needs.check.outputs.short }}
           path: ${{ steps.package.outputs.path }}
           retention-days: 1
           compression-level: 0
 
       - name: Publish GitHub release
-        if: steps.check.outputs.exists != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ steps.resolve.outputs.tag }}
-          TITLE: ${{ steps.resolve.outputs.title }}
-          ASSET: ${{ steps.resolve.outputs.asset }}
-          SHA: ${{ steps.resolve.outputs.sha }}
+          TAG: ${{ needs.check.outputs.tag }}
+          TITLE: ${{ needs.check.outputs.title }}
+          ASSET: ${{ needs.check.outputs.asset }}
+          SHORT: ${{ needs.check.outputs.short }}
+          SHA: ${{ needs.check.outputs.sha }}
           SUM: ${{ steps.package.outputs.sum }}
           SIZE: ${{ steps.package.outputs.size }}
           PATH_ASSET: ${{ steps.package.outputs.path }}
@@ -202,8 +208,29 @@ jobs:
               tar -xzf $ASSET -C /
           EOF
 
+          if [ "$FORCE" = "true" ]; then
+            # A rebuild of this commit supersedes its older, differently dated
+            # releases as well, so drop those entirely.
+            while read -r tag; do
+              [ -n "$tag" ] || continue
+              [ "$tag" = "$TAG" ] && continue
+              echo "removing release $tag"
+              gh release delete "$tag" --yes --cleanup-tag
+            done < <(gh release list --limit 500 --json tagName --jq '.[].tagName' | grep "_${SHORT}\$" || true)
+
+            # Start the target release from an empty asset list.
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              while read -r name; do
+                [ -n "$name" ] || continue
+                echo "removing asset $name"
+                gh release delete-asset "$TAG" "$name" --yes
+              done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
+            fi
+          fi
+
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$PATH_ASSET" --clobber
+            gh release upload "$TAG" "$PATH_ASSET"
+            gh release edit "$TAG" --title "$TITLE" --notes-file "$notes"
           else
             gh release create "$TAG" "$PATH_ASSET" --title "$TITLE" --notes-file "$notes"
           fi
