@@ -45,7 +45,6 @@ jobs:
       sha: ${{ steps.resolve.outputs.sha }}
       short: ${{ steps.resolve.outputs.short }}
       tag: ${{ steps.resolve.outputs.tag }}
-      asset: ${{ steps.resolve.outputs.asset }}
       title: ${{ steps.resolve.outputs.title }}
     steps:
       - name: Resolve source commit
@@ -63,7 +62,6 @@ jobs:
             echo "sha=$sha"
             echo "short=$short"
             echo "tag=${date}_${short}"
-            echo "asset=erofs_freebsd_kernel_amd64_${short}.tar.gz"
             echo "title=EROFS FreeBSD Kernel ${short}"
           } >> "$GITHUB_OUTPUT"
           echo "#### $SRC_REPO ${SRC_BRANCH:-HEAD} -> $sha" >> "$GITHUB_STEP_SUMMARY"
@@ -90,13 +88,31 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GENERIC carries the std.debug set (WITNESS, INVARIANTS, buffer
+          # tracking), which is what produces a usable crash report.
+          - name: debug
+            kernconf: GENERIC
+            asset: erofs_freebsd_kernel_debug_amd64_${{ needs.check.outputs.short }}.tar.gz
+            keep-full: "true"
+            expect-witness: "true"
+          # GENERIC-NODEBUG is the tree's own WITNESS/INVARIANTS free config,
+          # meant for benchmarks; see its header comment.
+          - name: nodebug
+            kernconf: GENERIC-NODEBUG
+            asset: erofs_freebsd_kernel_amd64_${{ needs.check.outputs.short }}.tar.gz
+            keep-full: "false"
+            expect-witness: "false"
     steps:
-      - name: Build FreeBSD kernel
+      - name: Build the ${{ matrix.kernconf }} kernel
         uses: imrcpan/freebsd-kernel-ci-tester@main
         with:
           src-repo: ${{ env.SRC_REPO }}
           src-branch: ${{ needs.check.outputs.sha }}
-          kernconf: GENERIC
+          kernconf: ${{ matrix.kernconf }}
           # The world is never shipped, so always build against the prebuilt one.
           skip-world: true
           export-image: ${{ env.BUNDLE }}
@@ -105,7 +121,10 @@ jobs:
         id: package
         env:
           SHA: ${{ needs.check.outputs.sha }}
-          ASSET: ${{ needs.check.outputs.asset }}
+          ASSET: ${{ matrix.asset }}
+          KERNCONF: ${{ matrix.kernconf }}
+          KEEP_FULL: ${{ matrix.keep-full }}
+          EXPECT_WITNESS: ${{ matrix.expect-witness }}
         run: |
           set -euo pipefail
           work="$RUNNER_TEMP/kernel"
@@ -113,7 +132,7 @@ jobs:
           mkdir -p "$out"
 
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-utils zstd
+          sudo apt-get install -y -qq qemu-utils zstd binutils
           sudo modprobe ufs || echo "::warning::could not load the ufs module"
 
           # export-image leaves the powered-off VM behind: a qcow2 disk plus
@@ -151,32 +170,63 @@ jobs:
             exit 1
           fi
 
+          # Make sure the debug options really are in the state this matrix
+          # entry promises, so a wrong kernconf cannot slip into a release.
+          witness="$(readelf --syms --wide "$root/boot/kernel/kernel" \
+            | awk '{ print $8 }' | grep -c '^_*witness_' || true)"
+          echo "$KERNCONF: $witness witness symbols"
+          if [ "$EXPECT_WITNESS" = "true" ] && [ "$witness" -eq 0 ]; then
+            echo "::error::$KERNCONF has no WITNESS symbols, expected a debug kernel"
+            exit 1
+          fi
+          if [ "$EXPECT_WITNESS" = "false" ] && [ "$witness" -ne 0 ]; then
+            echo "::error::$KERNCONF has WITNESS symbols, expected a nodebug kernel"
+            exit 1
+          fi
+          if [ "$EXPECT_WITNESS" = "false" ] && [ -e "$root/boot/kernel/kernel.full" ]; then
+            echo "::warning::nodebug kernel still ships kernel.full"
+          fi
+
           cat > "$work/build-info.txt" <<EOF
           source-repo: $SRC_REPO
           source-branch: $SRC_BRANCH
           commit: $SHA
-          kernconf: GENERIC
+          kernconf: $KERNCONF
           built: $(date -u +%Y-%m-%dT%H:%M:%SZ)
           EOF
 
-          sudo tar -C "$root" -czf "$out/$ASSET" boot/kernel -C "$work" build-info.txt
+          if [ "$KEEP_FULL" = "true" ]; then
+            sudo tar -C "$root" -czf "$out/$ASSET" boot/kernel -C "$work" build-info.txt
+          else
+            # kernel.full is only useful when debugging, and it is by far the
+            # largest thing in the tree.
+            sudo tar -C "$root" --exclude='boot/kernel/kernel.full' \
+              -czf "$out/$ASSET" boot/kernel -C "$work" build-info.txt
+          fi
           sudo chown "$(id -u):$(id -g)" "$out/$ASSET"
-          (cd "$out" && sha256sum "$ASSET" > "$ASSET.sha256")
           ls -lh "$out"
 
-          {
-            echo "path=$out/$ASSET"
-            echo "sum=$(cut -d' ' -f1 "$out/$ASSET.sha256")"
-            echo "size=$(stat -c%s "$out/$ASSET")"
-          } >> "$GITHUB_OUTPUT"
+          echo "path=$out/$ASSET" >> "$GITHUB_OUTPUT"
 
       - name: Upload the kernel tarball
         uses: actions/upload-artifact@v7
         with:
-          name: erofs-freebsd-kernel-${{ needs.check.outputs.short }}
+          name: kernel-${{ matrix.name }}-${{ needs.check.outputs.short }}
           path: ${{ steps.package.outputs.path }}
           retention-days: 1
           compression-level: 0
+
+  publish:
+    needs: [check, build-kernel]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download the kernel tarballs
+        uses: actions/download-artifact@v8
+        with:
+          pattern: kernel-*-${{ needs.check.outputs.short }}
+          path: ${{ runner.temp }}/assets
+          merge-multiple: true
 
       - name: Publish GitHub release
         env:
@@ -184,29 +234,43 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.check.outputs.tag }}
           TITLE: ${{ needs.check.outputs.title }}
-          ASSET: ${{ needs.check.outputs.asset }}
           SHORT: ${{ needs.check.outputs.short }}
           SHA: ${{ needs.check.outputs.sha }}
-          SUM: ${{ steps.package.outputs.sum }}
-          SIZE: ${{ steps.package.outputs.size }}
-          PATH_ASSET: ${{ steps.package.outputs.path }}
+          ASSETS: ${{ runner.temp }}/assets
         run: |
           set -euo pipefail
+          mapfile -t files < <(ls -1 "$ASSETS"/*.tar.gz)
+          if [ "${#files[@]}" -ne 2 ]; then
+            echo "::error::expected 2 kernel tarballs, found ${#files[@]}"
+            ls -l "$ASSETS"
+            exit 1
+          fi
+
           notes="$RUNNER_TEMP/release-notes.md"
-          cat > "$notes" <<EOF
-          FreeBSD kernel built from $SRC_REPO ($SRC_BRANCH).
-
-          * commit: $SHA
-          * kernel config: GENERIC
-          * built: $(date -u +%Y-%m-%dT%H:%M:%SZ)
-          * size: $SIZE bytes
-          * sha256: $SUM
-
-          The tarball holds boot/kernel (kernel and modules) plus build-info.txt.
-          Unpack it at the root of a matching FreeBSD system:
-
-              tar -xzf $ASSET -C /
-          EOF
+          {
+            echo "FreeBSD kernels built from $SRC_REPO ($SRC_BRANCH)."
+            echo
+            echo "* commit: \`$SHA\`"
+            echo "* built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "| asset | kernel config | purpose |"
+            echo "| --- | --- | --- |"
+            echo "| \`erofs_freebsd_kernel_amd64_${SHORT}.tar.gz\` | GENERIC-NODEBUG | benchmarks, WITNESS and INVARIANTS compiled out |"
+            echo "| \`erofs_freebsd_kernel_debug_amd64_${SHORT}.tar.gz\` | GENERIC | debugging, includes kernel.full |"
+            echo
+            echo "Each tarball holds \`boot/kernel\` (kernel and modules) plus \`build-info.txt\`."
+            echo "Unpack it at the root of a matching FreeBSD system:"
+            echo
+            echo '```sh'
+            echo 'tar -xzf <asset> -C /'
+            echo '```'
+            echo
+            echo "sha256:"
+            echo
+            echo '```'
+            (cd "$ASSETS" && sha256sum -- *.tar.gz)
+            echo '```'
+          } > "$notes"
 
           if [ "$FORCE" = "true" ]; then
             # A rebuild of this commit supersedes its older, differently dated
@@ -229,9 +293,18 @@ jobs:
           fi
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$PATH_ASSET"
+            gh release upload "$TAG" "${files[@]}"
             gh release edit "$TAG" --title "$TITLE" --notes-file "$notes"
           else
-            gh release create "$TAG" "$PATH_ASSET" --title "$TITLE" --notes-file "$notes"
+            gh release create "$TAG" "${files[@]}" --title "$TITLE" --notes-file "$notes"
           fi
-          echo "#### released $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "#### released $TAG with ${#files[@]} assets" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the release notes
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-notes-${{ needs.check.outputs.short }}
+          path: ${{ runner.temp }}/release-notes.md
+          retention-days: 1
+          if-no-files-found: ignore
